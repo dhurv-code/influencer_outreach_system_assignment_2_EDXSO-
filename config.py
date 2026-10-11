@@ -3,20 +3,22 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = Path(os.getenv("SCHOLARSHIP_DB_PATH", DATA_DIR / "scholarships.db"))
+DB_PATH = Path(os.getenv("SCHOLARSHIP_DB_PATH", str(DATA_DIR / "scholarships.db")))
 USER_AGENT = os.getenv(
     "CRAWLER_USER_AGENT",
-    "ScholarshipIntelligenceCrawler/1.0 (educational project; respectful crawling)"
+    "ScholarshipIntelligenceCrawler/1.1 (educational project; respectful crawling)",
 )
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-MAX_PAGES_PER_RUN = int(os.getenv("MAX_PAGES_PER_RUN", "80"))
-MAX_LINKS_PER_PAGE = int(os.getenv("MAX_LINKS_PER_PAGE", "30"))
-CRAWL_DELAY_SECONDS = float(os.getenv("CRAWL_DELAY_SECONDS", "1.0"))
-SEARCH_DISCOVERY_ENABLED = os.getenv("SEARCH_DISCOVERY_ENABLED", "true").lower() == "true"
+REQUEST_TIMEOUT = max(3, int(os.getenv("REQUEST_TIMEOUT", "15")))
+MAX_PAGES_PER_RUN = max(1, int(os.getenv("MAX_PAGES_PER_RUN", "80")))
+MAX_LINKS_PER_PAGE = max(1, int(os.getenv("MAX_LINKS_PER_PAGE", "30")))
+CRAWL_DELAY_SECONDS = max(0.0, float(os.getenv("CRAWL_DELAY_SECONDS", "1.0")))
+SEARCH_DISCOVERY_ENABLED = os.getenv("SEARCH_DISCOVERY_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
-# Starting points only. The crawler also discovers candidate pages from links and search results.
+# Seed sources are starting points, not a hard-coded list of scholarship records.
 SEED_URLS = [
     "https://scholarships.gov.in/",
     "https://www.aicte-india.org/",
@@ -27,8 +29,8 @@ SEED_URLS = [
     "https://www.inspireawards-dst.gov.in/",
 ]
 
-# Official domains that can be recognized when a provider uses a non-government domain.
-# Add domains only after manually checking that they belong to the actual provider.
+# Exact provider domains that have been manually reviewed as official.
+# Add a non-government provider only after checking that the domain belongs to it.
 KNOWN_OFFICIAL_DOMAINS = {
     "scholarships.gov.in",
     "nsp.gov.in",
@@ -42,22 +44,3 @@ KNOWN_OFFICIAL_DOMAINS = {
     "iccr.gov.in",
     "ugc.ac.in",
 }
-
-
-# import os
-
-# from dotenv import load_dotenv
-
-# load_dotenv()
-
-# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-# DB_PATH = os.path.join(os.path.dirname(__file__), "data", "scholarships.db")
-
-# # Seed URLs for intelligent discovery (Government, Universities, CSRs)
-# SEED_DISCOVERY_URLS = [
-#     "https://scholarships.gov.in/",
-#     "https://www.education.gov.in/scholarships",
-#     "https://www.buddy4study.com/scholarships", # Used as aggregator for discovery ONLY
-# ]
-
-# OFFICIAL_DOMAIN_SUFFIXES = [".gov.in", ".edu.in", ".ac.in", ".org", ".nic.in"]

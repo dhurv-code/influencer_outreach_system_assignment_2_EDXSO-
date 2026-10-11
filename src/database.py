@@ -1,28 +1,41 @@
-import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
 from config import DB_PATH
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+
+@contextmanager
 def connect(db_path=None):
+    """Open a SQLite connection, commit on success, roll back on error, and always close."""
     path = Path(db_path or DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
+    conn.execute("PRAGMA busy_timeout = 30000")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _migrate_schema(conn):
-    """Add missing columns to an existing SQLite database."""
-
+    """Add missing columns to older databases without deleting existing records."""
     additions = {
         "scholarships": {
             "fingerprint": "TEXT",
+            "source_url": "TEXT NOT NULL DEFAULT ''",
+            "source_is_official": "INTEGER NOT NULL DEFAULT 0",
             "name": "TEXT NOT NULL DEFAULT 'Untitled scholarship'",
             "provider": "TEXT NOT NULL DEFAULT 'Not specified'",
             "official_source_url": "TEXT NOT NULL DEFAULT ''",
@@ -64,25 +77,19 @@ def _migrate_schema(conn):
             "records_created": "INTEGER DEFAULT 0",
             "records_updated": "INTEGER DEFAULT 0",
             "errors_count": "INTEGER DEFAULT 0",
-            "notes": "TEXT"
-        }
+            "notes": "TEXT",
+        },
     }
-
     for table, columns in additions.items():
-        existing = {
-            row["name"]
-            for row in conn.execute(
-                f"PRAGMA table_info({table})"
-            ).fetchall()
-        }
-
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         for column, definition in columns.items():
             if column not in existing:
-                conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN "
-                    f"{column} {definition}"
-                )
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+    # Old versions used official_source_url for every fetched page. Preserve it as source_url
+    # for re-crawling; the next crawl re-evaluates whether the domain is actually official.
+    conn.execute("UPDATE scholarships SET source_url=official_source_url WHERE source_url='' AND official_source_url<>''")
+    conn.execute("UPDATE scholarships SET source_is_official=1 WHERE verification_status='VERIFIED' AND source_url<>''")
 
 
 def init_db(db_path=None):
@@ -103,6 +110,8 @@ def init_db(db_path=None):
         CREATE TABLE IF NOT EXISTS scholarships (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fingerprint TEXT UNIQUE,
+            source_url TEXT NOT NULL DEFAULT '',
+            source_is_official INTEGER NOT NULL DEFAULT 0,
             name TEXT NOT NULL DEFAULT 'Untitled scholarship',
             provider TEXT NOT NULL DEFAULT 'Not specified',
             official_source_url TEXT NOT NULL DEFAULT '',
@@ -146,8 +155,7 @@ def init_db(db_path=None):
             detected_at TEXT NOT NULL,
             source_url TEXT NOT NULL,
             evidence TEXT,
-            FOREIGN KEY(scholarship_id)
-                REFERENCES scholarships(id)
+            FOREIGN KEY(scholarship_id) REFERENCES scholarships(id)
         );
 
         CREATE TABLE IF NOT EXISTS crawl_errors (
@@ -159,89 +167,78 @@ def init_db(db_path=None):
             FOREIGN KEY(run_id) REFERENCES crawl_runs(id)
         );
         """)
-
-        # Add columns missing from an older database.
         _migrate_schema(conn)
-
-        # Create indexes only after migration.
         conn.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_scholarships_status
-            ON scholarships(current_status);
-
-        CREATE INDEX IF NOT EXISTS idx_scholarships_verification
-            ON scholarships(verification_status);
-
-        CREATE INDEX IF NOT EXISTS idx_scholarships_name
-            ON scholarships(name);
-
-        CREATE INDEX IF NOT EXISTS idx_change_log_scholarship
-            ON change_log(scholarship_id);
+        CREATE INDEX IF NOT EXISTS idx_scholarships_status ON scholarships(current_status);
+        CREATE INDEX IF NOT EXISTS idx_scholarships_verification ON scholarships(verification_status);
+        CREATE INDEX IF NOT EXISTS idx_scholarships_name ON scholarships(name);
+        CREATE INDEX IF NOT EXISTS idx_scholarships_source_url ON scholarships(source_url);
+        CREATE INDEX IF NOT EXISTS idx_change_log_scholarship ON change_log(scholarship_id);
         """)
-
     return True
 
 
 def row_to_dict(row):
     return dict(row) if row else None
 
+
 def list_scholarships(db_path=None, search_text="", status="All", limit=500):
     with connect(db_path) as conn:
         query = "SELECT * FROM scholarships WHERE 1=1"
         params = []
         if search_text:
-            query += " AND (name LIKE ? OR provider LIKE ? OR eligibility LIKE ?)"
+            query += " AND (name LIKE ? OR provider LIKE ? OR eligibility LIKE ? OR source_url LIKE ?)"
             pattern = f"%{search_text}%"
-            params.extend([pattern, pattern, pattern])
+            params.extend([pattern, pattern, pattern, pattern])
         if status != "All":
             query += " AND current_status = ?"
             params.append(status)
         query += " ORDER BY confidence_score DESC, updated_at DESC LIMIT ?"
-        params.append(int(limit))
-        return [dict(r) for r in conn.execute(query, params).fetchall()]
+        params.append(max(1, int(limit)))
+        return [dict(row) for row in conn.execute(query, params).fetchall()]
+
 
 def get_scholarship(scholarship_id, db_path=None):
     with connect(db_path) as conn:
-        row = conn.execute("SELECT * FROM scholarships WHERE id=?", (scholarship_id,)).fetchone()
-        return row_to_dict(row)
+        return row_to_dict(conn.execute("SELECT * FROM scholarships WHERE id=?", (scholarship_id,)).fetchone())
+
 
 def get_change_history(scholarship_id, db_path=None):
     with connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM change_log WHERE scholarship_id=? ORDER BY detected_at DESC",
-            (scholarship_id,)
+            "SELECT * FROM change_log WHERE scholarship_id=? ORDER BY detected_at DESC, id DESC",
+            (scholarship_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(row) for row in rows]
+
 
 def dashboard_metrics(db_path=None):
     with connect(db_path) as conn:
         total = conn.execute("SELECT COUNT(*) FROM scholarships").fetchone()[0]
-        verified = conn.execute(
-            "SELECT COUNT(*) FROM scholarships WHERE verification_status='VERIFIED'"
-        ).fetchone()[0]
-        review = conn.execute(
-            "SELECT COUNT(*) FROM scholarships WHERE verification_status='REVIEW REQUIRED'"
-        ).fetchone()[0]
-        active = conn.execute(
-            "SELECT COUNT(*) FROM scholarships WHERE current_status IN ('ACTIVE','EXPIRING_SOON')"
-        ).fetchone()[0]
-        expired = conn.execute(
-            "SELECT COUNT(*) FROM scholarships WHERE current_status='EXPIRED'"
-        ).fetchone()[0]
+        verified = conn.execute("SELECT COUNT(*) FROM scholarships WHERE verification_status='VERIFIED'").fetchone()[0]
+        review = conn.execute("SELECT COUNT(*) FROM scholarships WHERE verification_status='REVIEW REQUIRED'").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM scholarships WHERE current_status IN ('ACTIVE','EXPIRING_SOON')").fetchone()[0]
+        expired = conn.execute("SELECT COUNT(*) FROM scholarships WHERE current_status='EXPIRED'").fetchone()[0]
+        stale = conn.execute("SELECT COUNT(*) FROM scholarships WHERE current_status IN ('REVIEW_REQUIRED','NO_LONGER_VERIFIABLE')").fetchone()[0]
         avg = conn.execute("SELECT AVG(confidence_score) FROM scholarships").fetchone()[0] or 0
-        recently_updated = conn.execute(
-            "SELECT COUNT(*) FROM scholarships WHERE updated_at >= datetime('now','-7 days')"
+        recent = conn.execute(
+            "SELECT COUNT(*) FROM scholarships WHERE julianday(updated_at) >= julianday('now','-7 days')"
         ).fetchone()[0]
         return {
-            "total": total, "verified": verified, "review_required": review,
-            "active": active, "expired": expired, "average_confidence": round(avg, 2),
-            "recently_updated": recently_updated
+            "total": total,
+            "verified": verified,
+            "review_required": review,
+            "active": active,
+            "expired": expired,
+            "stale": stale,
+            "average_confidence": round(avg, 2),
+            "recently_updated": recent,
         }
+
 
 def record_error(url, error, run_id=None, db_path=None):
     with connect(db_path) as conn:
         conn.execute(
             "INSERT INTO crawl_errors(url,error,occurred_at,run_id) VALUES(?,?,?,?)",
-            (url, str(error)[:1500], utc_now(), run_id)
+            (url, str(error)[:1500], utc_now(), run_id),
         )
-
-
